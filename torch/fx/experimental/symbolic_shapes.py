@@ -409,7 +409,11 @@ class DimDynamic(Enum):
 # eager code with StrictMinMaxConstraint will keep working in the future!
 
 @dataclass(frozen=True)
-class StrictMinMaxConstraint:
+class Constraint:
+    warn_only : bool
+
+@dataclass(frozen=True)
+class StrictMinMaxConstraint(Constraint):
     """
     For clients: the size at this dimension must be within 'vr' (which
     specifies a lower and upper bound, inclusive-inclusive) AND it
@@ -434,8 +438,9 @@ class StrictMinMaxConstraint:
         # TODO: better printing for -oo and oo
         return f"{self.vr.lower} <= {source.name()} <= {self.vr.upper}"
 
+
 @dataclass(frozen=True)
-class RelaxedUnspecConstraint:
+class RelaxedUnspecConstraint(Constraint):
     """
     For clients: no explicit constraint; constraint is whatever is implicitly
     inferred by guards from tracing.
@@ -1324,6 +1329,17 @@ def _lru_cache(fn, maxsize=None):
     wrapper.cache_info = fn_cache.cache_info  # type: ignore[attr-defined]
     return wrapper
 
+@dataclass(frozen=True)
+class ShapeGuardExprSources:
+    """
+    Represents a shape guard expression, with the related sources.
+
+    Ex:
+        expr: x < y * 2
+        sources: LocalInputSource(x), LocalInputSource(y)
+    """
+    expr: str
+    sources: List[Source]
 
 class ShapeGuardPrinter(StrPrinter):
     def __init__(
@@ -1331,11 +1347,13 @@ class ShapeGuardPrinter(StrPrinter):
         symbol_to_source,
         source_ref,
         var_to_sources,
+        sources,
     ):
         super().__init__()
         self.symbol_to_source = symbol_to_source
         self.source_ref = source_ref
         self.var_to_sources = var_to_sources
+        self.sources = sources
 
     def _print_Symbol(self, expr) -> str:
         assert isinstance(expr, sympy.Symbol), str(type(expr))
@@ -1351,12 +1369,13 @@ class ShapeGuardPrinter(StrPrinter):
             f"not in {repr_symbol_to_source()}.  If this assert is failing, it could be "
             "due to the issue described in https://github.com/pytorch/pytorch/pull/90665"
         )
-        return self.source_ref(self.symbol_to_source[expr][0])
+        source = self.symbol_to_source[expr][0]
+        return self.source_ref(source, self.sources)
 
 
 class LoggingShapeGuardPrinter(ShapeGuardPrinter):
     def __init__(self, var_to_sources):
-        super().__init__(var_to_sources, lambda n: n.name(), var_to_sources)
+        super().__init__(var_to_sources, lambda n: n.name(), var_to_sources, [])
 
 
 TLS = threading.local()
@@ -1631,7 +1650,7 @@ class ShapeEnv:
             self.var_to_sources[r].append(source)
         return r
 
-    # Generates a list of guards strings which, when evaluated in a context that
+    # Generates a list of guards ShapeGuardExprSources which, when evaluated in a context that
     # defines tensors for all the sources, returns True or False depending
     # on if the guards in the list evaluated to True or not.  Primarily used by Dynamo,
     # but this is also helpful for manual testing of guards (see
@@ -1650,7 +1669,7 @@ class ShapeEnv:
         self,
         placeholders,
         sources,
-        source_ref=lambda n: n.name(),
+        source_ref=lambda n, _: n.name(),
         *,
         # An input is either a SymInt (in which case you directly have
         # DimConstraint) or a Tensor (in which case you have a
@@ -1658,7 +1677,8 @@ class ShapeEnv:
         # just means there are no constraints
         constraint_inputs: Optional[InputList[Union[DimConstraint, Optional[DimList[DimConstraint]]]]] = None,
         _simplified=False
-    ) -> List[str]:
+    ) -> List[ShapeGuardExprSources]:
+
         assert len(placeholders) == len(sources)
 
         # Expand optional inputs, or verify invariants are upheld
@@ -1790,6 +1810,7 @@ class ShapeEnv:
                                 return "Did you really mean to mark this dimension as dynamic?"
 
                         record_constraint_violation(lambda: (
+                            constraint,
                             f"Could not validate constraint {constraint.render(source)} as "
                             f"{source.name()} is actually a non-atomic symbolic expression "
                             f"{s}.  {hint()}"
@@ -1801,6 +1822,7 @@ class ShapeEnv:
                 input_guards.append((source, s))
                 if constraint is not None:
                     record_constraint_violation(lambda: (
+                        constraint,
                         f"Could not validate constraint {constraint.render(source)} as "
                         f"{source.name()} was inferred to be constant.  For more information "
                         # TODO: fold this into TORCH_LOGS
@@ -1839,8 +1861,9 @@ class ShapeEnv:
                     source == symbol_to_source[expr][0]
                 ):
                     continue
-                sexpr = ShapeGuardPrinter(symbol_to_source, source_ref, self.var_to_sources).doprint(expr)
-                exprs.append(f"{source_ref(source)} == {sexpr}")
+                guard_sources = []
+                sexpr = ShapeGuardPrinter(symbol_to_source, source_ref, self.var_to_sources, guard_sources).doprint(expr)
+                exprs.append(ShapeGuardExprSources(f"{source_ref(source, guard_sources)} == {sexpr}", guard_sources))
                 # NB: Not necessary to report constraint violations here:
                 # constraints are guaranteed to be on symbols (we've already
                 # caught constants and non-atomic expressions), so we only
@@ -1854,8 +1877,9 @@ class ShapeEnv:
                 continue
             g = self.simplify(g)
             try:
-                guard_expr = ShapeGuardPrinter(symbol_to_source, source_ref, self.var_to_sources).doprint(g)
-                exprs.append(guard_expr)
+                guard_sources = []
+                guard_expr = ShapeGuardPrinter(symbol_to_source, source_ref, self.var_to_sources, guard_sources).doprint(g)
+                exprs.append(ShapeGuardExprSources(guard_expr, guard_sources))
                 # A non-relational constraint on a single sizevar can violate
                 # a constraint
                 if len(g.free_symbols) == 1:
@@ -1865,6 +1889,7 @@ class ShapeEnv:
                     for c in constraints:
                         if isinstance(c, StrictMinMaxConstraint):
                             record_constraint_violation(lambda: (
+                                c,
                                 f"Could not validate (strict) constraint {c.render(source)} as "
                                 f"we generated a guard on this size variable: {guard_expr}.  Guard "
                                 f"was allocated at:\n{tb}"
@@ -1902,6 +1927,7 @@ class ShapeEnv:
                         # vr is superset of c_vr
                         if not (c_vr.lower == r.lower and c_vr.upper == r.upper):
                             record_constraint_violation(lambda: (
+                                c,
                                 f"Could not validate constraint {c.render(sources[0])} as "
                                 f"we actually inferred the valid range to be [{vr.lower}, {vr.upper}]."
                                 "This is actually supposed to be impossible to "
@@ -1915,7 +1941,8 @@ class ShapeEnv:
                 bounds = []
                 if r.lower != -sympy.oo:
                     bounds.append(str(r.lower))
-                bounds.append(source_ref(sources[0]))
+                guard_sources = []
+                bounds.append(source_ref(sources[0], guard_sources))
                 # NB: This looks like an off-by-one error but it's not: the
                 # upper bound may be sys.maxsize - 1 because we intentionally
                 # exclude sys.maxsize from our bounds to deal with direct
@@ -1926,18 +1953,31 @@ class ShapeEnv:
                 if r.upper != sympy.oo and r.upper < sys.maxsize - 1:
                     bounds.append(str(r.upper))
                 if len(bounds) > 1:
-                    exprs.append(" <= ".join(bounds))
+                    exprs.append(ShapeGuardExprSources(" <= ".join(bounds), guard_sources))
 
         if constraint_violations:
-            msgs = [f"  {i + 1}. {msg()}" for i, msg in enumerate(constraint_violations)]
-            msgs = "\n".join(msgs)
-            raise ConstraintViolationError(f"Constraints violated!\n{msgs}")
+            raise_msgs = []
+            warn_msgs = []
+            for msg_fn in constraint_violations:
+                constraint, msg = msg_fn()
+                if constraint.warn_only:
+                    msg = f"  {len(warn_msgs) + 1}. {msg}"
+                    warn_msgs.append(msg)
+                else:
+                    msg = f"  {len(raise_msgs) + 1}. {msg}"
+                    raise_msgs.append(msg)
+
+            log.warning(f"Warning only constraints violated \n {warn_msgs}")
+            if len(raise_msgs) > 0:
+                raise ConstraintViolationError(f"Constraints violated!\n{raise_msgs}")
+
         return exprs
 
     def evaluate_guards_for_args(self, placeholders, args):
         from torch._dynamo.source import LocalSource
         arg_names = [f"t{i}" for i in range(len(args))]
         guards = self.produce_guards(placeholders, [LocalSource(a) for a in arg_names])
+        guards = [guard.expr for guard in guards]
         if guards:
             code = " and ".join(guards)
             return eval(code, SYMPY_INTERP, {"L": dict(zip(arg_names, args))})

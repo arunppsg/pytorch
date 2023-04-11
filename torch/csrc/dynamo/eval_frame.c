@@ -300,13 +300,13 @@ THPPyInterpreterFrame* THPPyInterpreterFrame_New(_PyInterpreterFrame* frame) {
 // Flag to just run a frame normally
 #define SKIP_CODE ((void*)0x1)
 
-static PyObject* guard_fail_hook = NULL;
 static PyObject* guard_error_hook = NULL;
 static PyObject* profiler_start_hook = NULL;
 static PyObject* profiler_end_hook = NULL;
 static PyObject* guard_profiler_name_str = NULL; /* cached py str */
 
-size_t extra_index = -1;
+size_t cache_entry_extra_index = -1;
+size_t dynamic_frame_state_extra_index = -2;
 
 static Py_tss_t eval_frame_callback_key = Py_tss_NEEDS_INIT;
 
@@ -406,14 +406,21 @@ inline static void enable_eval_frame_default(PyThreadState* tstate) {
 static inline PyObject* call_callback(
     PyObject* callable,
     THP_EVAL_API_FRAME_OBJECT* _frame,
-    long cache_len) {
+    long cache_len,
+    PyObject* installed_guard_subexpression,
+    PyObject* frame_state) {
 
 #if IS_PYTHON_3_11_PLUS
   THPPyInterpreterFrame* frame = THPPyInterpreterFrame_New(_frame);
 #else
   PyFrameObject* frame = _frame;
 #endif
-  PyObject* args = Py_BuildValue("(Ol)", frame, cache_len);
+  // A null installed_guard_subexpression is 100% valid - it will be the case when we have never seen a frame before, and there
+  // were no guards to run.
+  if (installed_guard_subexpression == NULL) {
+    installed_guard_subexpression = Py_None;
+  }
+  PyObject* args = Py_BuildValue("(OlOO)", frame, cache_len, installed_guard_subexpression, frame_state);
   if (args == NULL) {
     return NULL;
   }
@@ -456,13 +463,24 @@ static void destroy_cache_entry(CacheEntry* e) {
 
 inline static CacheEntry* get_extra(PyCodeObject* code) {
   CacheEntry* extra = NULL;
-  _PyCode_GetExtra((PyObject*)code, extra_index, (void*)&extra);
+  _PyCode_GetExtra((PyObject*)code, cache_entry_extra_index, (void*)&extra);
   return extra;
 }
 
 inline static void set_extra(PyCodeObject* code, CacheEntry* extra) {
   // TODO(jansel): would it be faster to bypass this?
-  _PyCode_SetExtra((PyObject*)code, extra_index, extra);
+  _PyCode_SetExtra((PyObject*)code, cache_entry_extra_index, extra);
+}
+
+inline static PyObject* get_frame_state(PyCodeObject* code) {
+  PyObject* extra = NULL;
+  _PyCode_GetExtra((PyObject*)code, dynamic_frame_state_extra_index, (void*)&extra);
+  return extra;
+}
+
+inline static void set_frame_state(PyCodeObject* code, PyObject* extra) {
+  // TODO(jansel): would it be faster to bypass this?
+  _PyCode_SetExtra((PyObject*)code, dynamic_frame_state_extra_index, extra);
 }
 
 inline static const char* name(THP_EVAL_API_FRAME_OBJECT* frame) {
@@ -510,16 +528,18 @@ static void call_profiler_end_hook(PyObject* record) {
   Py_DECREF(args);
 }
 
+// Here, installed_guard_subexpression ownership exists outside the lookup - it always enters as NULL and exits as either NULL
+// or a value. We incref it before usage, and decref it after.
 // Return value: borrowed reference
 // Is either Py_None or a PyCodeObject
-static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEntry* prev, size_t index) {
+static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEntry* prev, size_t index, PyObject** installed_guard_subexpression) {
   if (e == NULL) {
     // NB: intentionally not using Py_RETURN_NONE, to return borrowed ref
     return Py_None;
   }
   PyObject *f_locals = frame->f_locals;
-  PyObject* valid = PyObject_CallOneArg(e->check_fn, f_locals);
-  if (unlikely(valid == NULL)) {
+  PyObject* result = PyObject_CallOneArg(e->check_fn, f_locals);
+  if (unlikely(result == NULL) || unlikely(!PyTuple_Check(result))) {
     if (guard_error_hook != NULL) {
       PyObject *type, *value, *traceback;
       PyErr_Fetch(&type, &value, &traceback);
@@ -532,7 +552,8 @@ static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEn
     }
     return NULL;
   }
-  Py_DECREF(valid);
+
+  PyObject* valid = PyTuple_GetItem(result, 0);
   if (valid == Py_True) {
     // Keep the head as the most recently used cache entry.
     // If the hit cache entry is not the head of the linked list,
@@ -543,16 +564,22 @@ static PyObject* lookup(CacheEntry* e, THP_EVAL_API_FRAME_OBJECT *frame, CacheEn
         e->next = extra;
         set_extra(frame->f_code, e);
     }
+    Py_DECREF(result);
     return (PyObject*)e->code;
   }
-  if (unlikely(guard_fail_hook != NULL)) {
-    PyObject* r = call_guard_fail_hook(guard_fail_hook, e, index, f_locals);
-    if (r == NULL) {
-      return NULL;
-    }
-    Py_DECREF(r);
+  // valid == False
+  // fail_installed_guard_subexpression is a borrowed ref here
+  PyObject* fail_installed_guard_subexpression = PyTuple_GetItem(result, 1);
+  Py_DECREF(result);
+  PyObject* lookup_result = lookup(e->next, frame, e, index + 1, installed_guard_subexpression);
+  // NULL is valid here for fail_installed_guard_subexpression, but not for **installed_guard_subexpression, we ensure we never send a null to the
+  // callback when we call_callback
+  if (installed_guard_subexpression != NULL) {
+    // assign **installed_guard_subexpression that was passed in from fail_installed_guard_subexpression
+    // We still have not incremented it
+    *installed_guard_subexpression = fail_installed_guard_subexpression;
   }
-  return lookup(e->next, frame, e, index + 1);
+  return lookup_result;
 }
 
 static long cache_size(CacheEntry* e) {
@@ -750,20 +777,28 @@ static PyObject* _custom_eval_frame(
   if (callback == Py_False) {
     DEBUG_TRACE("In run only mode %s", name(frame));
     PyObject* hook_record = call_profiler_start_hook(guard_profiler_name_str);
-    PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0);
+    // installed_guard_subexpression starts at NULL, always. If we fail a guard, it is assigned.
+    PyObject *installed_guard_subexpression = NULL;
+    PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0, &installed_guard_subexpression);
+    // installed_guard_subexpression is either borrowed ref, or NULL here, so we make sure to incref it here
+    Py_XINCREF(installed_guard_subexpression);
+
     call_profiler_end_hook(hook_record);
     Py_XDECREF(hook_record);
 
     if (maybe_cached_code == NULL) {
       // guard eval failed, keep propagating
+      Py_XDECREF(installed_guard_subexpression);
       return NULL;
     } else if (maybe_cached_code == Py_None) {
       DEBUG_TRACE("cache miss %s", name(frame));
+      Py_XDECREF(installed_guard_subexpression);
       return eval_frame_default(tstate, frame, throw_flag);
     }
     PyCodeObject* cached_code = (PyCodeObject*)maybe_cached_code;
     // used cached version
     DEBUG_TRACE("cache hit %s", name(frame));
+    Py_XDECREF(installed_guard_subexpression);
     return eval_custom_code(tstate, frame, cached_code, throw_flag);
   }
   DEBUG_CHECK(PyDict_CheckExact(frame->f_locals));
@@ -776,11 +811,16 @@ static PyObject* _custom_eval_frame(
   eval_frame_callback_set(Py_None);
 
   PyObject* hook_record = call_profiler_start_hook(guard_profiler_name_str);
-  PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0);
+  // installed_guard_subexpression starts at NULL, always. If we fail a guard, it is assigned.
+  PyObject* installed_guard_subexpression = NULL;
+  PyObject* maybe_cached_code = lookup(extra, frame, NULL, 0, &installed_guard_subexpression);
+  // installed_guard_subexpression is either borrowed ref, or NULL here, so we make sure to incref it here
+  Py_XINCREF(installed_guard_subexpression);
   call_profiler_end_hook(hook_record);
   Py_XDECREF(hook_record);
   if (maybe_cached_code == NULL) {
     // Python error
+    Py_XDECREF(installed_guard_subexpression);
     return NULL;
   } else if (maybe_cached_code != Py_None) {
     PyCodeObject* cached_code = (PyCodeObject*)maybe_cached_code;
@@ -788,14 +828,26 @@ static PyObject* _custom_eval_frame(
     DEBUG_TRACE("cache hit %s", name(frame));
     // Re-enable custom behavior
     eval_frame_callback_set(callback);
+    Py_XDECREF(installed_guard_subexpression);
     return eval_custom_code(tstate, frame, cached_code, throw_flag);
   }
   // cache miss
 
   // TODO(alband): This is WRONG for python3.11+ we pass in a _PyInterpreterFrame
   // that gets re-interpreted as a PyObject (which it is NOT!)
+  PyObject *frame_state = get_frame_state(frame->f_code);
+  if (frame_state == NULL) {
+    // TODO(voz): Replace this dict with a real FrameState object.
+    frame_state = PyDict_New();
+    set_frame_state(frame->f_code, frame_state);
+  }
   PyObject* result =
-      call_callback(callback, frame, cache_size(extra));
+      call_callback(callback, frame, cache_size(extra), installed_guard_subexpression, frame_state);
+  // installed_guard_subexpression is always either a valid InstalledGuardSubexpression object (guard fail),
+  // None (guard pass), or NULL It is not sound to decref none, so we check here before we do.
+  if (installed_guard_subexpression != Py_None) {
+    Py_XDECREF(installed_guard_subexpression);
+  }
   if (result == NULL) {
     // internal exception, returning here will leak the exception into user code
     // this is useful for debugging -- but we dont want it to happen outside of
@@ -902,7 +954,10 @@ static PyObject* reset_code(PyObject* dummy, PyObject* args) {
   }
 
   destroy_cache_entry(get_extra((PyCodeObject*)code));
+  PyObject* frame_state = get_frame_state((PyCodeObject*)code);
+  Py_XDECREF(frame_state);
   set_extra((PyCodeObject*)code, NULL);
+  set_frame_state((PyCodeObject*)code, NULL);
   Py_RETURN_NONE;
 }
 
@@ -930,20 +985,6 @@ static PyObject* skip_code(PyObject* dummy, PyObject* args) {
   Py_RETURN_NONE;
 }
 
-static PyObject* set_guard_fail_hook(PyObject* dummy, PyObject* args) {
-  PyObject* obj = NULL;
-  if (!PyArg_ParseTuple(args, "O", &obj)) {
-    return NULL;
-  }
-  Py_XDECREF(guard_fail_hook);
-  if (obj == Py_None) {
-    guard_fail_hook = NULL;
-  } else {
-    guard_fail_hook = obj;
-    Py_INCREF(guard_fail_hook);
-  }
-  Py_RETURN_NONE;
-}
 
 static PyObject* set_guard_error_hook(PyObject* dummy, PyObject* args) {
   PyObject* obj = NULL;
@@ -996,7 +1037,6 @@ static PyMethodDef _methods[] = {
     {"reset_code", reset_code, METH_VARARGS, NULL},
     {"unsupported", unsupported, METH_VARARGS, NULL},
     {"skip_code", skip_code, METH_VARARGS, NULL},
-    {"set_guard_fail_hook", set_guard_fail_hook, METH_VARARGS, NULL},
     {"set_guard_error_hook", set_guard_error_hook, METH_VARARGS, NULL},
     {"set_profiler_hooks", set_profiler_hooks, METH_VARARGS, NULL},
     {"clear_profiler_hooks", clear_profiler_hooks, METH_VARARGS, NULL},
@@ -1010,7 +1050,8 @@ static struct PyModuleDef _module = {
     _methods};
 
 PyObject* torch_c_dynamo_eval_frame_init(void) {
-  extra_index = _PyEval_RequestCodeExtraIndex(ignored);
+  cache_entry_extra_index = _PyEval_RequestCodeExtraIndex(ignored);
+  dynamic_frame_state_extra_index = _PyEval_RequestCodeExtraIndex(ignored);
 
   int result = PyThread_tss_create(&eval_frame_callback_key);
   CHECK(result == 0);
