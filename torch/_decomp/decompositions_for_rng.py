@@ -5,7 +5,6 @@ import torch
 import torch._decomp as decomp
 from torch._ops import OpOverload
 from torch._prims_common import make_contiguous_strides_for
-from torch._subclasses.fake_tensor import disable_fake_tensor_mode_tracing
 
 
 aten = torch.ops.aten
@@ -75,7 +74,7 @@ def rand(shape, dtype=None, layout=torch.strided, device=None, pin_memory=False)
     seed, offset = PhiloxStateTracker.get_state_as_tuple()
     dtype = dtype or torch.float32
     stride = make_contiguous_strides_for(shape)
-    r = torch.ops.prims.philox_rand(shape, seed, offset, stride, device, dtype)
+    r = torch.ops.rngprims.philox_rand(shape, seed, offset, stride, device, dtype)
     PhiloxStateTracker.advance_offset(rand_offset_calculator(shape))
     return r
 
@@ -94,7 +93,7 @@ def rand_like(
         throw_on_non_cuda(device)
     dtype = dtype or x.dtype
     seed, offset = PhiloxStateTracker.get_state_as_tuple()
-    r = torch.ops.prims.philox_rand(x.shape, seed, offset, x.stride(), device, dtype)
+    r = torch.ops.rngprims.philox_rand(x.shape, seed, offset, x.stride(), device, dtype)
     PhiloxStateTracker.advance_offset(rand_offset_calculator(x.shape))
     return r
 
@@ -170,6 +169,12 @@ class PhiloxStateTracker:
     bwd_state = PhiloxState()
 
     @classmethod
+    def reset(cls):
+        cls.running_state = PhiloxState()
+        cls.fwd_state = PhiloxState()
+        cls.bwd_state = PhiloxState()
+
+    @classmethod
     def mark_beginning_of_forward(cls):
         # Tells the tracker to use fwd_state as the running state
         cls.running_state = cls.fwd_state
@@ -178,17 +183,6 @@ class PhiloxStateTracker:
     def mark_beginning_of_backward(cls):
         # Tells the tracker to use bwd_state as the running state
         cls.running_state = cls.bwd_state
-
-    @classmethod
-    def mark_end_of_tracing(cls):
-        # Reset the state so that next occurence of AOTAutograd has clean slate
-        cls.clear()
-
-    @classmethod
-    def clear(cls):
-        cls.running_state = PhiloxState()
-        cls.fwd_state = PhiloxState()
-        cls.bwd_state = PhiloxState()
 
     @classmethod
     def record_state(cls, seed, offset, mode):
@@ -245,16 +239,18 @@ class RNGStateHelper:
     @staticmethod
     def get_torch_state_as_tuple(fake_mode=None):
         if not torch.cuda.is_available():
-            return torch.tensor(0), torch.tensor(0)
-        # torch.cuda.get_rng_state yields a real tensor, and upsets fake
-        # tensor for the following ops.
-        with disable_fake_tensor_mode_tracing():
-            rng_state = torch.cuda.get_rng_state()
-            seed = rng_state[800:808].view(dtype=torch.int64)[0]
-            offset = rng_state[808:].view(dtype=torch.int64)[0]
+            seed = torch.tensor(0)
+            offset = torch.tensor(0)
+            if fake_mode:
+                seed = fake_mode.from_tensor(seed)
+                offset = fake_mode.from_tensor(offset)
+            return seed, offset
+
+        rng_state = torch.cuda.get_rng_state()
         if fake_mode:
-            seed = fake_mode.from_tensor(seed)
-            offset = fake_mode.from_tensor(offset)
+            rng_state = fake_mode.from_tensor(rng_state)
+        seed = rng_state[800:808].view(dtype=torch.int64)[0]
+        offset = rng_state[808:].view(dtype=torch.int64)[0]
         return seed, offset
 
     @staticmethod

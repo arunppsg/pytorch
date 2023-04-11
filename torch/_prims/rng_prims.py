@@ -3,48 +3,77 @@ from typing import Tuple
 import torch
 from torch import _prims
 from torch._decomp.decompositions_for_rng import RNGStateHelper, throw_on_non_cuda
+
+from torch._prims_common import make_contiguous_strides_for
+from torch._prims_common.wrappers import backwards_not_supported
 from torch.types import _device, _dtype
 
-
-def _philox_rand(
-    shape: torch.Size,
-    seed: torch.Tensor,
-    offset: torch.Tensor,
-    stride: Tuple[int, ...],
-    device: _device,
-    dtype: _dtype,
-):
-    # stride arg will be useful for distributed usecase. Currently, its unused.
-    if device.type == "cpu":
-        devices = []
-    else:
-        devices = [device]
-
-    if device.type != "cuda":
-        raise throw_on_non_cuda(device)
-
-    with torch.random.fork_rng(devices):
-        RNGStateHelper.set_torch_state_tensor(seed, offset)
-        return torch.rand(shape, device=device, dtype=dtype)
+rngprim_namespace = "rngprims"
+rngprim = torch.library.Library(rngprim_namespace, "DEF")
+rngprim_impl = torch.library.Library(
+    rngprim_namespace, "IMPL", "CompositeExplicitAutograd"
+)
+rngprim_autograd_impl = torch.library.Library(rngprim_namespace, "IMPL", "Autograd")
+rngprim_meta_impl = torch.library.Library(rngprim_namespace, "IMPL", "Meta")
 
 
-def _philox_rand_meta(
-    shape: torch.Size,
-    seed: torch.Tensor,
-    offset: torch.Tensor,
-    stride: Tuple[int, ...],
-    device: _device,
-    dtype: _dtype,
-):
-    return _prims.TensorMeta(shape=shape, strides=stride, dtype=dtype, device=device)
+def register_philox_rand():
+    name = "philox_rand"
+    schema = "philox_rand(int[] size, Tensor seed, Tensor offset, int[] stride, Device? device=None, ScalarType? dtype=None) -> Tensor"  # noqa: B950
+
+    rngprim.define(schema)
+
+    def _philox_rand_meta(
+        shape: torch.Size,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+        stride: Tuple[int, ...],
+        device: _device,
+        dtype: _dtype,
+    ):
+        strides = make_contiguous_strides_for(shape)
+        return _prims.TensorMeta(
+            shape=shape, strides=stride, dtype=dtype, device=device
+        )
+
+    def _philox_rand(
+        shape: torch.Size,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+        stride: Tuple[int, ...],
+        device: _device,
+        dtype: _dtype,
+    ):
+        # stride arg will be useful for distributed usecase. Currently, its unused.
+        if device.type == "cpu":
+            devices = []
+        else:
+            devices = [device]
+
+        if device.type != "cuda":
+            raise throw_on_non_cuda(device)
+
+        with torch.random.fork_rng(devices):
+            RNGStateHelper.set_torch_state_tensor(seed, offset)
+            return torch.rand(shape, device=device, dtype=dtype)
+
+    rngprim_impl.impl(name, _philox_rand)
+    rngprim_meta_impl.impl(name, _philox_rand_meta)
+
+    prim_packet = getattr(torch._ops.ops.rngprims, name)
+    prim = prim_packet.default
+    prim._tags = (torch.Tag.nondeterministic_seeded,)  # type: ignore[attr-defined]
+
+    rngprim_autograd_impl.impl(name, backwards_not_supported(prim))
+
+    for p in (prim_packet, prim):
+        p.__doc__ = "Philox based stateless rand operator"
+        p.return_type = torch._prims_common.RETURN_TYPE.NEW  # type: ignore[attr-defined]
+
+        p.schema = schema
+        p.prim_meta_impl = _philox_rand_meta
+        p.impl_aten = _philox_rand
 
 
 def register_rng_prims():
-    _prims._make_prim(
-        schema="philox_rand(int[] size, Tensor seed, Tensor offset, int[] stride, Device? device=None, ScalarType? dtype=None) -> Tensor",  # noqa: B950
-        return_type=_prims.RETURN_TYPE.NEW,
-        meta=_philox_rand_meta,
-        impl_aten=_philox_rand,
-        tags=(torch.Tag.nondeterministic_seeded,),  # type: ignore[attr-defined]
-        doc="Philox based stateless rand operator",
-    )
+    register_philox_rand()

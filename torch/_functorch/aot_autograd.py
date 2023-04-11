@@ -1173,7 +1173,6 @@ def create_functionalized_graph(
         # returned by AOTAutograd (both autograd.Function for training and
         # simple wrapper for inference)
         aot_config.philox_total_offsets = PhiloxStateTracker.get_accumulated_offsets()
-        PhiloxStateTracker.mark_end_of_tracing()
 
 
     return fx_g
@@ -2331,6 +2330,7 @@ def create_functionalized_rng_ops_wrapper(func, args, trace_joint=True):
             with patch("torch.cuda.set_rng_state", override_set_rng_state):
                 return func(*primals)
 
+    PhiloxStateTracker.reset()
     if trace_joint:
         # Get the current seed and offset to setup tracing.
         fwd_seed, fwd_base_offset = RNGStateHelper.get_torch_state_as_tuple(fake_mode)

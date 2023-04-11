@@ -14,7 +14,7 @@ import torch.utils.checkpoint
 
 
 def count_philox_rand(gm, args, freq):
-    assert [node.target for node in gm.graph.nodes].count(torch.ops.prims.philox_rand.default) == freq
+    assert [node.target for node in gm.graph.nodes].count(torch.ops.rngprims.philox_rand.default) == freq
     return gm
 
 class TestFunctionalizationRngOps(TestCase):
