@@ -89,6 +89,7 @@ static Tensor& pad_out_template(Tensor& output,
   int64_t pad_front = padding_size > 4 ? padding[4] : 0;
   int64_t pad_back = padding_size > 4 ? padding[5] : 0;
 
+  std::cout << "dim_w=" << dim_w << " dim_h=" << dim_h << " pad_l=" << pad_l << " pad_r=" << pad_r << std::endl;
   int64_t nplane = input_.size(dim_slices);
   int64_t input_w = input_.size(dim_w);
   int64_t output_w = input_w + pad_l + pad_r;
@@ -96,6 +97,7 @@ static Tensor& pad_out_template(Tensor& output,
   int64_t output_h = padding_dim > 1 ? input_h + pad_t + pad_b : 0;
   int64_t input_d = padding_dim > 2 ? input_.size(dim_d) : 0;
   int64_t output_d = padding_dim > 2 ? input_d + pad_front + pad_back : 0;
+  std::cout << "nplane=" << nplane << " input_w=" << input_w << " output_w=" << output_w << std::endl;
 
   Tensor grad_output, input = input_;
 
@@ -177,6 +179,7 @@ static Tensor& pad_out_template(Tensor& output,
     }
 
     output.resize_(outputSizes);
+	std::cout << "inputSizes=" << input_.sizes() << " outputSizes=" << outputSizes << std::endl;
 
     if (output.numel() == 0) {
       return output;
@@ -241,6 +244,16 @@ static Tensor& pad_out_template(Tensor& output,
       }
     }
   }
+  std::cout << "dims_mask=" << dims_mask << std::endl;
+  // NSLog leftPadVec
+  for (int i = 0; i < leftPadVec.size(); i++) {
+    NSLog(@"leftPadVec[%d]=%@", i, leftPadVec[i]);
+  }
+  //NSLog rightPadVec
+  for (int i = 0; i < rightPadVec.size(); i++) {
+    NSLog(@"rightPadVec[%d]=%@", i, rightPadVec[i]);
+  }
+
   MPSShape* leftPadding = [NSArray arrayWithObjects:leftPadVec.data() count:ndims];
   MPSShape* rightPadding = [NSArray arrayWithObjects:rightPadVec.data() count:ndims];
 
@@ -259,6 +272,7 @@ static Tensor& pad_out_template(Tensor& output,
       const bool needsSlice = startMask != dims_mask || endMask != dims_mask;
 
       if (!is_backward_pass) {
+		std::cout << "calling mpsGraph padTensor constantValue=" << constantValue << std::endl;
         MPSGraphTensor* padTensor = [mpsGraph padTensor:newCachedGraph->inputTensor_
                                         withPaddingMode:mode
                                             leftPadding:leftPadding
